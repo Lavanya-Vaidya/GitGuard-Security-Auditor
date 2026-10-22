@@ -1,0 +1,29 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# AWS generated files and credentials
+.aws-sam/
+.aws/
+.sam/
+credentials
+config
+
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.json
+secrets.yaml
+secrets.yml
+
+# Local temporary files
+temp.txt
+.DS_Store
