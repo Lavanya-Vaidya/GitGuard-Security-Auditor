@@ -1,0 +1,14 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "git-security-auditor"
+resolve_s3 = false
+s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-1o51jndsiolc"
+s3_prefix = "git-security-auditor"
+region = "ap-south-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "GitHubSecretArn=\"arn:aws:secretsmanager:ap-south-1:997206200952:secret:github-security-auditor-secret-vpsqhb\" BedrockModelId=\"us.amazon.nova-micro-v1:0\" MaxDiffSize=\"100000\" DashboardJwtIssuer=\"https://dev-e02wdr2cpwcp1idt.us.auth0.com/\" DashboardJwtAudience=\"https://gitguard-security-auditor-api\" DashboardAllowedOrigin=\"http://localhost:5173\" DashboardJwtScope=\"gitguard/audit.read\""
+
+[default.global.parameters]
+region = "ap-south-1"
