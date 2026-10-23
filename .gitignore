@@ -27,3 +27,5 @@ secrets.yml
 # Local temporary files
 temp.txt
 .DS_Store
+node_modules
+/dist/

@@ -2,6 +2,54 @@
 
 # 🛡️ GitGuard — Automated AI Security Auditor for Pull Requests
 
+## Frontend dashboard and audit API
+
+The React/Vite frontend lives at the repository root. Start it locally with:
+
+```bash
+npm install
+cp .env.example .env
+# Set VITE_API_BASE_URL to the deployed HTTP API base URL, without a trailing slash.
+npm run dev
+```
+
+An empty `VITE_API_BASE_URL` selects the visibly labelled illustrative demo dataset in `src/data/demo.js`. With a URL configured, the frontend uses the real API and does not fall back to demo data on authentication, network, or server errors. Live requests require the hosting application to provide an in-memory OIDC token adapter before the React app starts:
+
+```js
+window.GITGUARD_AUTH = {
+  getAccessToken: async () => oidcClient.getAccessToken(),
+};
+```
+
+The adapter must return a short-lived access token whose issuer, audience, and `gitguard/audit.read` scope match the SAM configuration below. It must keep tokens in the identity client’s session memory and refresh them as needed. The frontend never stores tokens in localStorage or sessionStorage. Do not put a static bearer token, client secret, AWS credential, GitHub key, or webhook secret in Vite environment variables.
+
+### Read API contract
+
+- `GET /dashboard?limit=100&nextToken=...` returns `audits`, flattened `findings`, derived `repositories`, and an opaque `nextToken`. `limit` is 1–100; the API reads a bounded DynamoDB scan page. Continue with the token to read later pages.
+- `GET /audits/{id}` returns one audit. `id` is URL-safe base64 of UTF-8 `{repo}#{pr_number}#{commit_sha}`. The Lambda validates each field and constructs the exact DynamoDB key `{PK: "{repo}#{pr_number}", SK: "{commit_sha}"}` for a strongly consistent `GetItem`.
+- Audit JSON includes available `id`, `repo`, `number`, `sha`, `status`, `timestamp`, `counts`, `findingDetails`, and scan metadata. Findings retain their filename and stored model fields. The worker does not persist a PR title, author, repository visibility, finding category, or resolution state, so the API does not invent them.
+
+The SAM HTTP API applies an OIDC JWT authorizer and requires the configured OAuth scope on both read routes. `POST /webhook` retains its existing GitHub HMAC signature validation and is not covered by the JWT authorizer. The Dashboard Lambda has only `dynamodb:GetItem` and `dynamodb:Scan` on the audit table. CORS is restricted to the exact dashboard origin parameter. This is a single workspace API: users who receive the required scope can read all audit records in that deployment. Configure the identity provider to grant the scope only to intended workspace users. The template accepts an HTTPS origin for production and `http://localhost[:port]` for development.
+
+### Deploy the dashboard API
+
+Supply your OIDC issuer URL, the token audience, and the HTTPS origin where the React app is hosted. Example:
+
+```bash
+sam build
+sam deploy --guided \
+  --parameter-overrides \
+    GitHubSecretArn=YOUR_EXISTING_SECRET_ARN \
+    DashboardJwtIssuer=https://cognito-idp.REGION.amazonaws.com/USER_POOL_ID \
+    DashboardJwtAudience=YOUR_APP_CLIENT_ID \
+    DashboardAllowedOrigin=https://dashboard.example.com \
+    DashboardJwtScope=gitguard/audit.read
+```
+
+The issuer and audience must match the access token claims from your OIDC provider, and the provider must issue the configured scope. For Cognito, register the custom resource-server scope on the app client. The example uses a Cognito issuer; the stack does not create a user pool, resource server, or login UI. Obtain a token from your organization’s existing OIDC sign-in flow and connect it through the in-memory adapter. After deployment, CloudFormation outputs `DashboardEndpoint`, `AuditDetailEndpointTemplate`, and the existing `WebhookEndpoint`. Set `VITE_API_BASE_URL` to the API base URL (the part before `/dashboard`), then rebuild and host the frontend over HTTPS. For local frontend development, set `DashboardAllowedOrigin=http://localhost:5173`. `sam validate` and local tests do not deploy resources; deployment is an explicit operator step.
+
+Build the frontend with `npm run build`; generated files go to `dist/` and remain outside the SAM backend package.
+
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white)](https://python.org)
 [![AWS SAM](https://img.shields.io/badge/AWS_SAM-Serverless-orange?logo=amazon-aws&logoColor=white)](https://aws.amazon.com/serverless/sam/)
 [![AWS Bedrock](https://img.shields.io/badge/AWS_Bedrock-GenAI-purple?logo=amazon-aws)](https://aws.amazon.com/bedrock/)
@@ -159,7 +207,7 @@ sequenceDiagram
 - **Type**: HTTP API (API Gateway v2), not REST API v1.
   - HTTP API is **70% cheaper** than REST API and has **60% lower latency** for simple proxy routes.
   - Payload Format Version 2.0 provides a cleaner event structure with automatic base64 detection.
-- **Route**: `POST /webhook` — routes directly to the Ingest Lambda.
+- **Routes**: `POST /webhook` routes to the Ingest Lambda; JWT-authorized `GET /dashboard` and `GET /audits/{id}` route to the read-only Dashboard Lambda.
 - **Stage**: `$default` (auto-deployed, no stage prefix in URL).
 - **Why not Lambda Function URL?**: API Gateway provides centralized logging, throttling, and makes future AWS WAF integration trivial.
 
@@ -579,6 +627,10 @@ sam deploy --guided
 | GitHubSecretArn | *(paste Secret ARN from Step 2)* |
 | BedrockModelId | `apac.amazon.nova-micro-v1:0` |
 | MaxDiffSize | `100000` |
+| DashboardJwtIssuer | HTTPS issuer URL from your OIDC provider |
+| DashboardJwtAudience | Audience accepted for dashboard access tokens |
+| DashboardAllowedOrigin | Exact HTTPS frontend origin (or `http://localhost:5173` for local development) |
+| DashboardJwtScope | `gitguard/audit.read` (the OIDC provider must issue this scope) |
 | Allow SAM CLI IAM role creation | `Y` |
 
 ### Step 4: Configure GitHub App Webhook
@@ -586,6 +638,8 @@ sam deploy --guided
 After deployment, SAM outputs:
 ```
 WebhookEndpoint: https://xxxxxxxx.execute-api.ap-south-1.amazonaws.com/webhook
+DashboardEndpoint: https://xxxxxxxx.execute-api.ap-south-1.amazonaws.com/dashboard
+AuditDetailEndpointTemplate: https://xxxxxxxx.execute-api.ap-south-1.amazonaws.com/audits/{id}
 ```
 
 1. Update **Webhook URL** in your GitHub App settings.
@@ -713,6 +767,9 @@ Based on **1,000 Pull Request scans per month** (~3 files per PR, ~150K tokens t
 │   ├── ingest/
 │   │   ├── app.py                   # Webhook handler (verify → filter → dedup → invoke)
 │   │   ├── requirements.txt         # (empty — stdlib + boto3 only)
+│   │   └── __init__.py
+│   ├── dashboard/
+│   │   ├── app.py                   # JWT-protected, read-only DynamoDB dashboard API
 │   │   └── __init__.py
 │   │
 │   └── worker/
@@ -889,6 +946,10 @@ When prompted during `sam deploy --guided`:
 - **GitHubSecretArn**: Paste your Secret ARN from Step 1
 - **BedrockModelId**: `us.google.gemma-2-27b-it-v1:0` (or your model of choice)
 - **MaxDiffSize**: `100000`
+- **DashboardJwtIssuer**: HTTPS issuer URL for your OIDC identity provider
+- **DashboardJwtAudience**: Audience claim value for dashboard access tokens
+- **DashboardAllowedOrigin**: Exact HTTPS frontend origin (or `http://localhost:5173` for local development)
+- **DashboardJwtScope**: `gitguard/audit.read`; configure the provider to issue it only to authorized workspace users
 - Allow SAM to create IAM roles.
 
 ### Step 3: Configure GitHub App Webhook URL
@@ -902,6 +963,8 @@ https://xxxxxxxxxx.execute-api.us-east-1.amazonaws.com/webhook
 2. In the **Webhook URL** field, paste your `WebhookEndpoint` URL.
 3. In the **Webhook secret** field, enter the same `webhook_secret` you stored in Secrets Manager.
 4. Click **Save changes** and install the GitHub App onto your target repository or organization.
+
+The stack also outputs authenticated dashboard read URLs. Configure the OIDC issuer, audience, and scope before deployment, then set `VITE_API_BASE_URL` to the shared API base and connect the host application's in-memory `window.GITGUARD_AUTH.getAccessToken()` adapter as described in [Frontend dashboard and audit API](#frontend-dashboard-and-audit-api). No static access token should be built into the frontend.
 
 ---
 

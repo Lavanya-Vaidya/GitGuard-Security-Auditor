@@ -14,6 +14,21 @@ Parameters:
     Type: Number
     Default: 100000
     Description: Maximum cumulative characters of diff to process per PR
+  DashboardJwtIssuer:
+    Type: String
+    Description: HTTPS issuer URL for the OIDC provider whose access tokens may read audit data
+    AllowedPattern: '^https://[A-Za-z0-9.-]+(:[0-9]+)?(/.*)?$'
+  DashboardJwtAudience:
+    Type: String
+    Description: Audience value required in dashboard access tokens
+  DashboardAllowedOrigin:
+    Type: String
+    Description: Exact dashboard origin (HTTPS in production; localhost is allowed for local development)
+    AllowedPattern: '^(https://[A-Za-z0-9.-]+(:[0-9]+)?|http://localhost(:[0-9]+)?)$'
+  DashboardJwtScope:
+    Type: String
+    Default: gitguard/audit.read
+    Description: OAuth scope required by both dashboard read routes
 
 Globals:
   Function:
@@ -31,6 +46,25 @@ Resources:
     Type: AWS::Serverless::HttpApi
     Properties:
       StageName: $default
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref DashboardAllowedOrigin
+        AllowHeaders:
+          - authorization
+          - content-type
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        MaxAge: 600
+      Auth:
+        Authorizers:
+          DashboardJwtAuthorizer:
+            IdentitySource: "$request.header.Authorization"
+            JwtConfiguration:
+              issuer: !Ref DashboardJwtIssuer
+              audience:
+                - !Ref DashboardJwtAudience
 
   # DynamoDB Table for Idempotency and Audit Findings
   SecurityAuditTable:
@@ -63,6 +97,12 @@ Resources:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/aws/lambda/${WorkerFunction}"
+      RetentionInDays: 14
+
+  DashboardLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${DashboardFunction}"
       RetentionInDays: 14
 
   # Ingest Lambda Function
@@ -140,10 +180,56 @@ Resources:
                 - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:provisioned-model/*"
                 - !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/*"
 
+  # Read-only dashboard API. It cannot mutate audit or webhook records.
+  DashboardFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/dashboard/
+      Handler: app.lambda_handler
+      Timeout: 15
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SecurityAuditTable
+      Policies:
+        - Statement:
+            - Sid: ReadAuditRecordsOnly
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Scan
+              Resource: !GetAtt SecurityAuditTable.Arn
+      Events:
+        DashboardGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /dashboard
+            Method: GET
+            Auth:
+              Authorizer: DashboardJwtAuthorizer
+              AuthorizationScopes:
+                - !Ref DashboardJwtScope
+        AuditDetailGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /audits/{id}
+            Method: GET
+            Auth:
+              Authorizer: DashboardJwtAuthorizer
+              AuthorizationScopes:
+                - !Ref DashboardJwtScope
+
 Outputs:
   WebhookEndpoint:
     Description: HTTP API endpoint URL to configure in GitHub Webhook settings
     Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/webhook"
+  DashboardEndpoint:
+    Description: JWT-authorized dashboard read endpoint
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/dashboard"
+  AuditDetailEndpointTemplate:
+    Description: JWT-authorized audit detail endpoint; replace {id} with the returned audit id
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/audits/{id}"
   SecurityAuditTableName:
     Description: Name of DynamoDB table storing audit results
     Value: !Ref SecurityAuditTable
